@@ -408,3 +408,93 @@ def calc_lamb(model, test_loader, config, device, scales=np.ones(3), biases=np.z
     t_range = t_range.numpy()
 
     return lambs, x_range, y_range, t_range, his_st_cum[:, :2], his_st_cum[:, 2]
+
+
+"""==============================================================================
+The code below is added by Tian You
+=============================================================================="""
+
+def get_model_output(model, seq, device):
+    st_x, _, _, _, _ = seq
+    background = model.background.cpu().detach()
+    _, w_i, b_i, inv_var = model(st_x.reshape([1,st_x.shape[0],-1]).to(device))
+    w_i  = w_i.cpu().detach()
+    b_i  = b_i.cpu().detach()
+    inv_var = inv_var.cpu().detach()
+    params = (background, w_i, b_i, inv_var)
+    return params
+
+def calc_s_kernel(s_diff, inv_var):
+    g2 = torch.sum(s_diff * inv_var * s_diff, -1)
+    g2 = torch.sqrt(torch.prod(inv_var, -1)) * torch.exp(-0.5*g2)/(2*np.pi)
+    return g2
+
+def s_kernel_mesh(params, seq, mesh_centre, scales=np.ones(2), biases=np.zeros(2)):
+
+    # get the parameters    
+    background, _, _, inv_var = params #get_model_params(model, st_x.reshape([1,st_x.shape[0],-1]), device)
+
+    # get the input data and scale it
+    st_x, _, _, _, _ = seq
+    bias_xy = torch.tensor(biases[0:2])
+    scales_xy = torch.tensor(scales[0:2])
+    s_grids = (mesh_centre - bias_xy) / scales_xy
+    
+    N = len(s_grids) # number of grid points
+    st_x = torch.cat((st_x[..., :-1], background), 0).unsqueeze(0).repeat(N, 1, 1)
+    s_diff = s_grids.unsqueeze(1) - st_x
+    s_kernel = calc_s_kernel(s_diff, inv_var.repeat(N, 1, 1))    
+
+    #print(s_kernel[0])
+
+    return s_kernel
+
+def t_kernel_mesh(params, seq, time_ahead, scales=np.ones(1), biases=np.zeros(1)):
+    
+    background, _, b_i, _ = params
+    num_points = background.shape[0]
+
+    _, _, st_x_cum, _, _ = seq
+
+    tn_ti = torch.cat((st_x_cum[-1,-1]-st_x_cum[:,2], torch.zeros(num_points)), 0)
+    t_ti_scaled = torch.sub(torch.add(tn_ti, time_ahead), biases) /scales
+    t_kernel = torch.exp(-b_i*t_ti_scaled)
+
+    #print(-b_i*t_ti_scaled)
+
+    return t_kernel
+
+def t_integral_mesh(params, seq, time_period, scales=np.ones(1), biases=np.zeros(1)):
+    background, _, b_i, _ = params
+    num_points = background.shape[0]
+
+    _, _, st_x_cum, _, _ = seq
+
+    tp, tq = time_period
+
+    tn_ti = torch.cat((st_x_cum[-1,-1]-st_x_cum[:,2], torch.zeros(num_points)), 0)
+    tp_ti_scaled = torch.sub(torch.add(tn_ti, tp), biases) /scales
+    tq_ti_scaled = torch.sub(torch.add(tn_ti, tq), biases) /scales
+
+    t_integral = 1/b_i * (torch.exp(-b_i*tp_ti_scaled) - torch.exp(-b_i*tq_ti_scaled))
+
+    return t_integral
+
+
+def calc_intensity_mesh(params, seq, mesh_centre, time_ahead, scales=np.ones(3), biases=np.zeros(3)):
+    _, w_i, _, _ = params
+    s_kernel = s_kernel_mesh(params, seq, mesh_centre, scales[:2], biases[:2])
+    t_kernel = t_kernel_mesh(params, seq, time_ahead, scales[-1], biases[-1])
+    lamb_st = torch.sum(s_kernel * t_kernel * w_i, -1).numpy()
+    return lamb_st
+
+
+def calc_expected_event_mesh(params, seq, mesh_centre, mesh_area, time_period, scales=np.ones(3), biases=np.zeros(3)):
+    _, w_i, _, _ = params
+
+    s_kernel = s_kernel_mesh(params, seq, mesh_centre, scales[:2], biases[:2])
+    s_integral = s_kernel * mesh_area / np.product(scales[:2])
+    t_integral = t_integral_mesh(params, seq, time_period, scales[-1], biases[-1])
+    expected_event_count = torch.sum(s_integral * t_integral * w_i, -1).numpy()
+    
+    return expected_event_count
