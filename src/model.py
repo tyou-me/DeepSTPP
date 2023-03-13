@@ -498,3 +498,80 @@ def calc_expected_event_mesh(params, seq, mesh_centre, mesh_area, time_period, s
     expected_event_count = torch.sum(s_integral * t_integral * w_i, -1).numpy()
     
     return expected_event_count
+
+
+
+# The following is adapted from the Jupyter notebook '2. Deep-STPP Visualization'
+
+def evaluate(model, st_scaler, test_loader, logger, device):
+    model.eval()
+    st_preds = []
+    st_ys = []
+    lookahead = config.lookahead
+
+    for index, data in enumerate(test_loader):
+        if len(data) == 6:
+            st_x, _, _, st_y, _, _ = data
+        else:
+            st_x, st_y = data
+
+        batch_size = st_x.shape[0]
+        st_pred = torch.zeros((batch_size, lookahead, 3), dtype=torch.float).to(device)
+        background = model.background.unsqueeze(0).repeat(batch_size, 1, 1).cpu().detach()
+        
+        for l in range(lookahead):
+            _, w_i, b_i, _ = model(st_x.to(device))
+            w_i  = w_i.cpu().detach()
+            b_i  = b_i.cpu().detach()
+            
+            st_pred_1step = np.zeros((batch_size, 1, 3))
+            
+            t_cum = torch.cumsum(st_x[..., 2], -1)
+            tn_ti = t_cum[..., -1:] - t_cum # t_n - t_i
+            tn_ti = torch.cat((tn_ti, torch.zeros(batch_size, config.num_points)), -1)
+            
+            # Time inference: integrate via linear interpolation
+            limit = config.infer_limit * st_scaler.scale_[-1]
+            ts = torch.arange(0, limit, limit * 1.0 / config.infer_nstep)
+            fts = [torch.exp(log_ft(t + tn_ti, tn_ti, w_i, b_i)) for t in ts]
+            fts = torch.stack(fts) / sum(fts, 0) # normalize probability 
+            predict_t = torch.sum(ts.unsqueeze(-1) * fts, 0) # expectation
+            st_pred_1step[:, 0, 2] = predict_t.numpy()
+            
+            # Space Inference            
+            v_i = w_i * torch.exp(-b_i * (tn_ti + predict_t.unsqueeze(-1)))
+            v_i = v_i / torch.sum(v_i, -1).unsqueeze(-1) # normalize
+            v_i = v_i.unsqueeze(-1).numpy()
+            
+            space = torch.cat((st_x[..., :2], background), 1)
+            st_pred_1step[:, 0, :2] = np.sum(v_i * space.cpu().detach().numpy(), 1)
+            
+            st_pred_1step = torch.tensor(st_pred_1step, dtype=torch.float)
+            st_pred[:, l, :] = st_pred_1step[:, 0, :]
+            st_x = torch.cat((st_x[:, 1:], st_pred_1step ), 1)
+
+        st_preds.append(st_pred)
+        st_ys.append(st_y)
+
+    st_preds = torch.cat(st_preds, dim=0).cpu().detach().numpy()
+    st_y = torch.cat(st_ys, dim=0).cpu().detach().numpy()
+    outputs = np.zeros(st_y.shape)
+    targets = np.zeros(st_y.shape)
+    
+    for i in range(st_y.shape[0]):
+        outputs[i] = st_scaler.inverse_transform(st_preds[i])
+        targets[i] = st_scaler.inverse_transform(st_y[i])
+
+    # Evaluate the performance using RMSE
+    space_rmse = [np.mean([np.sqrt(MSE(outputs[:, i, :2], targets[:, i, :2])) for i in range(la)]) for la in
+                  [1, ]] #[1, 5, 10, 20, 40]]
+    time_rmse = [np.mean([np.sqrt(MSE(outputs[:, i, 2], targets[:, i, 2])) for i in range(la)]) for la in
+                 [1, ]] #[1, 5, 10, 20, 40]]
+    total_rmse = [np.mean([np.sqrt(MSE(outputs[:, i, :], targets[:, i, :])) for i in range(la)]) for la in
+                  [1, ]] #[1, 5, 10, 20, 40]]
+
+    logger.info(f"The RMSE for space is {space_rmse}")
+    logger.info(f"The RMSE for time is {time_rmse}")
+    logger.info(f"The 3-tuple RMSE  is {total_rmse}")
+
+    return outputs, targets, [space_rmse, time_rmse, total_rmse]
