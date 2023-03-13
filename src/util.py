@@ -163,12 +163,13 @@ def train(model, train_loader, val_loader, config, logger, device):
             epoch, loss_meter.avg, sll_meter.avg , tll_meter.avg
         ))
         if (epoch+1)%config.eval_epoch==0:
-            print("Evaluate")
-            valloss, valspace, valtime = eval_loss(model, val_loader, device)
-            logger.info("Val Loss {:5f} | Space: {:5f} | Time: {:5f}".format(valloss, valspace, valtime))
-            if valloss < best_eval:
-                best_eval = valloss
-                best_model = copy.deepcopy(model)
+            with torch.no_grad():  # Added by Tian You on Mar 13, 2023
+                print("Evaluate")
+                valloss, valspace, valtime = eval_loss(model, val_loader, device)
+                logger.info("Val Loss {:5f} | Space: {:5f} | Time: {:5f}".format(valloss, valspace, valtime))
+                if valloss < best_eval:
+                    best_eval = valloss
+                    best_model = copy.deepcopy(model)
 
     print("training done!")
     return best_model
