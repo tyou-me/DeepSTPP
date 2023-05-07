@@ -53,14 +53,14 @@ class Encoder(nn.Module):
     def __init__(self, config, device):
         super().__init__()
         self.model_type = 'Transformer'
-        self.pos_encoder = PositionalEncoding(config.emb_dim, config.dropout, 
+        self.pos_encoder = PositionalEncoding(config.emb_dim, config.dropout,
                                               config.seq_len)
         encoder_layers = nn.TransformerEncoderLayer(config.emb_dim, config.num_head,
                                                     config.hid_dim, config.dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, config.nlayers)
         self.seq_len = config.seq_len
         self.ninp = config.emb_dim
-        self.encoder = nn.Linear(3, config.emb_dim, bias=False)
+        self.encoder = nn.Linear(3 + config.num_marks, config.emb_dim, bias=False)
         self.decoder = nn.Linear(config.emb_dim, config.z_dim * 2)
         self.init_weights()
         self.device = device
@@ -72,7 +72,7 @@ class Encoder(nn.Module):
         self.decoder.weight.data.uniform_(-initrange, initrange)
 
     def encode(self, x, x_mask=None):
-        x = x.transpose(1,0) # Convert to seq-len-first
+        x = x.transpose(1, 0)  # Convert to seq-len-first
         if x_mask is None:
             x_mask = subsequent_mask(len(x)).to(self.device)
         t = torch.cumsum(x[..., -1], 0)
@@ -82,7 +82,7 @@ class Encoder(nn.Module):
         output = self.transformer_encoder(x, x_mask)
         output = self.decoder(output)
         
-        output = output[-1] # get last output only
+        output = output[-1]  # get last output only; [batch, z_dim * 2]
         m, v_ = torch.split(output, output.size(-1) // 2, dim=-1)
         v = F.softplus(v_) + 1e-5
         return m, v
