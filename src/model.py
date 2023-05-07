@@ -198,16 +198,25 @@ def intensity(w_i, b_i, t_ti, s_diff, inv_var):
 STPP model with VAE: directly modeling λ(s,t)
 """
 class DeepSTPP(nn.Module):
-    def __init__(self, config, device):
-        super(DeepSTPP, self).__init__()
+    """
+    Updated by Tian You (TY): Modified version of the DeepSTPP model, which
+        1) allows the user to provide additional event semantics (='marks'), and
+        2) to control the initialisation of background points.
+    """
+    def __init__(self, config: DeepSTPPConfig, device: torch.device):
+        super().__init__()
         self.config = config
         self.emb_dim = config.emb_dim
         self.hid_dim = config.hid_dim
         self.device = device
         
+        self.num_marks = config.num_marks       # Updated by TY
+        self.num_points = config.num_points     # Updated by TY
+
         # VAE for predicting spatial intensity
         self.enc = Encoder(config, device)
         
+        # Make separate decoders for w, b, and s
         output_dim = config.seq_len + config.num_points
         self.w_dec = Decoder(config, output_dim, softplus=True)
         self.b_dec = Decoder(config, output_dim)
@@ -218,35 +227,53 @@ class DeepSTPP(nn.Module):
         self.z_prior_v = nn.Parameter(torch.ones(1), requires_grad=False)
         self.z_prior = (self.z_prior_m, self.z_prior_v)
         
-        # Background 
-        self.num_points = config.num_points
-        self.background = nn.Parameter(torch.rand((self.num_points, 2)), requires_grad=True)
-        
+        # Updated by TY: We allow the user to provide custom initialisations for 
+        # background points to ensure that said points are not initialised outside 
+        # the spatial domain of interest.
+        if isinstance(config.point_inits, str):
+            if config.point_inits.lower() == 'uniform':
+                inits = torch.rand((self.num_points, 2))
+            else:
+                raise ValueError(
+                    f"'{config.point_inits}' is not a recognised initialisation."
+                )
+        else:
+            inits = torch.from_numpy(config.point_inits)
+        self.background = nn.Parameter(inits, requires_grad=True)
+
         self.optimizer = self.set_optimizer(config.opt, config.lr, config.momentum)
         self.to(device)
 
-
-    """
-    st_x: [batch, seq_len, 3] (lat, lon, time)
-    st_y: [batch, 1, 3]
-    """
     def loss(self, st_x, st_y):
+        """
+        Updated by TY: Added additional marks to the model.
+        st_x: [batch, seq_len, 3 + num_marks] (s_1, s_2, mark_1, mark_2, ..., time)
+        st_y: [batch, 1, 3 + num_marks]
+        """
         batch = st_x.shape[0]
+        time_idx = 2 + self.num_marks
+
+        # Note that our loss does not depend on the optional marks,
+        # but only on spatio-temporal locations.
+        space_hist = st_x[..., :2]
+        space_fut = st_y[..., :2]
+        time_hist = st_x[..., time_idx]
+        time_fut = st_y[..., time_idx]
+
         background = self.background.unsqueeze(0).repeat(batch, 1, 1)
-        
-        s_diff = st_y[..., :2] - torch.cat((st_x[..., :2], background), 1) # s - s_i
-        t_cum = torch.cumsum(st_x[..., 2], -1)
-        
-        tn_ti = t_cum[..., -1:] - t_cum # t_n - t_i
+        s_diff = space_fut - torch.cat((space_hist, background), 1)  # s - s_i
+        t_cum = torch.cumsum(time_hist, -1)
+
+        tn_ti = t_cum[..., -1:] - t_cum  # t_n - t_i
         tn_ti = torch.cat((tn_ti, torch.zeros(batch, self.num_points).to(self.device)), -1)
-        t_ti  = tn_ti + st_y[..., 2] # t - t_i
+        t_ti = tn_ti + time_fut  # t - t_i
 
         [qm, qv], w_i, b_i, inv_var = self(st_x)
-            
+
         # Calculate likelihood
         sll = torch.log(s_intensity(w_i, b_i, t_ti, s_diff, inv_var))
         tll = log_ft(t_ti, tn_ti, w_i, b_i)
-        
+
         # KL Divergence
         if self.config.sample:
             kl = kl_normal(qm, qv, *self.z_prior).mean()
@@ -261,13 +288,23 @@ class DeepSTPP(nn.Module):
         # Encode history locations and times
         if self.config.sample:
             qm, qv = self.enc.encode(st_x) # Variational posterior
-            # Monte Carlo
             z = sample_gaussian(qm, qv)
         else:
             qm, qv = None, None
             z, _ = self.enc.encode(st_x)
         
         w_i = self.w_dec.decode(z)
+        b_i = self.decode_b(z)
+        s_i = self.s_dec.decode(z) + self.config.s_min
+        s_x, s_y = torch.split(s_i, s_i.size(-1) // 2, dim=-1)
+        inv_var = torch.stack((1 / s_x, 1 / s_y), -1)
+
+        return [qm, qv], w_i, b_i, inv_var
+
+    def decode_b(self, z):
+        '''
+        Updated by TY: put decode_b in a seperate function.
+        '''
         if self.config.constrain_b == 'tanh':
             b_i = torch.tanh(self.b_dec.decode(z)) * self.config.b_max
         elif self.config.constrain_b == 'sigmoid':
@@ -275,20 +312,13 @@ class DeepSTPP(nn.Module):
         elif self.config.constrain_b == 'neg-sigmoid':
             b_i = - torch.sigmoid(self.b_dec.decode(z)) * self.config.b_max
         elif self.config.constrain_b == 'softplus':
-            b_i = torch.nn.functional.softplus(self.b_dec.decode(z))
+            b_i = F.softplus(self.b_dec.decode(z))
         elif self.config.constrain_b == 'clamp':
             b_i = torch.clamp(self.b_dec.decode(z), -self.config.b_max, self.config.b_max)
         else:
             b_i = self.b_dec.decode(z)
-                    
-        s_i = self.s_dec.decode(z) + self.config.s_min
-        
-        s_x, s_y = torch.split(s_i, s_i.size(-1) // 2, dim=-1)
-        inv_var = torch.stack((1 / s_x, 1 / s_y), -1)
+        return b_i
 
-        return [qm, qv], w_i, b_i, inv_var
-  
-    
     def set_optimizer(self, opt, lr, momentum):
         if opt == 'SGD':
             return torch.optim.SGD(self.parameters(), lr=lr, momentum=momentum)
