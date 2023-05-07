@@ -330,37 +330,65 @@ class DeepSTPP(nn.Module):
 Calculate the uniformly samplded spatiotemporal intensity with a given
 number of spatiotemporal steps  
 """
-def calc_lamb(model, test_loader, config, device, scales=np.ones(3), biases=np.zeros(3),
-              t_nstep=201, x_nstep=101, y_nstep=101, total_time=None, round_time=True,
-              xmax=None, xmin=None, ymax=None, ymin=None):
-    
-    # Aggregate data
+def calc_lamb(model,
+              test_loader,
+              config,
+              device,
+              *,
+              seq_num: int = 0,
+              scales=None,
+              biases=None,
+              x_nstep=101,
+              y_nstep=101,
+              total_time=None,
+              num_frames_per_time_step: int = 2,
+              xmax=None,
+              xmin=None,
+              ymax=None,
+              ymin=None,
+              verbose=True):
+    """
+    Modified evaluation of the intensity function, which supports
+    selection of a specific sequence number from the test set, while
+    using a hard-coded discretisation of time.
+    """
+    scales = np.ones(3) if scales is None else scales
+    biases = np.ones(3) if biases is None else biases
+
+    # Sequence reconstruction:
+    #   Recall that the `SlidingWindowWrapper` splits our 'macroscopic'
+    #   source sequences into fixed-length 'micro-'sequences, which are
+    #   then collected into batches. Crucially, one batch may contain
+    #   'micro-'sequences from more than on macroscopic source sequence.
+    #   The loop below hence iterates through all test batches to re-construct
+    #   the original data.
     st_xs = []
     st_ys = []
     st_x_cums = []
     st_y_cums = []
-    for data in test_loader:
-        st_x, st_y, st_x_cum, st_y_cum, (idx, _) = data
-        mask = idx == 0 # Get the first sequence only
-        st_xs.append(st_x[mask])
-        st_ys.append(st_y[mask])
-        st_x_cums.append(st_x_cum[mask])
-        st_y_cums.append(st_y_cum[mask])
+    for batch in test_loader:
+        st_x, st_y, st_x_cum, st_y_cum, (idx, _) = batch
+        in_seq = idx == seq_num
+        if not torch.any(in_seq):
+            continue
+        st_xs.append(st_x[in_seq])
+        st_ys.append(st_y[in_seq])
+        st_x_cums.append(st_x_cum[in_seq])
+        st_y_cums.append(st_y_cum[in_seq])
 
-        if not torch.any(mask):
-            break
-        
-    # Stack the first sequence
+    # Stack the sequence
     st_x = torch.cat(st_xs, 0).cpu()
     st_y = torch.cat(st_ys, 0).cpu()
     st_x_cum = torch.cat(st_x_cums, 0).cpu()
     st_y_cum = torch.cat(st_y_cums, 0).cpu()
+
     if total_time is None:
         total_time = st_y_cum[-1, -1, -1]
 
-    print(f'Intensity time range : {total_time}')
+    if verbose:
+        print(f'Intensity time range : {total_time}')
     lambs = []
-    
+
     # Discretize space
     if xmax is None:
         xmax = 1.0
@@ -381,57 +409,54 @@ def calc_lamb(model, test_loader, config, device, scales=np.ones(3), biases=np.z
     
     # Discretize time
     t_start = st_x_cum[0, -1, -1].item()
-    t_step = (total_time - t_start) / (t_nstep - 1)
-    if round_time:
-        t_range = torch.arange(round(t_start)+1, round(total_time), 1.0)
-    else:
-        t_range = torch.arange(t_start, total_time, t_step)
-        
+    t_start = math.floor(t_start) + 1
+    t_stop = math.ceil(total_time)
+    n_steps = (t_stop - t_start) * num_frames_per_time_step + 1
+    t_range = torch.linspace(t_start, t_stop, n_steps)
+
     # Calculate intensity
     background = model.background.unsqueeze(0).cpu().detach()
 
     # Sample model parameters
     _, w_i, b_i, inv_var = model(st_x.to(device))
-    w_i  = w_i.cpu().detach()
-    b_i  = b_i.cpu().detach()
+    w_i = w_i.cpu().detach()
+    b_i = b_i.cpu().detach()
     inv_var = inv_var.cpu().detach()
     
     # Convert to history
-    his_st     = torch.vstack((st_x[0], st_y.squeeze())).numpy()
+    his_st = torch.vstack((st_x[0], st_y.squeeze())).numpy()
     his_st_cum = torch.vstack((st_x_cum[0], st_y_cum.squeeze())).numpy()
 
-    for t in tqdm(t_range):
-        i = sum(st_x_cum[:, -1, -1] <= t) - 1 # index of corresponding history events
+    for t in tqdm(t_range, leave=verbose):
+        i = sum(st_x_cum[:, -1, -1] <= t) - 1  # index of corresponding history events
 
-        st_x_ = st_x[i:i+1]
-        w_i_ = w_i[i:i+1]
-        b_i_ = b_i[i:i+1]
-        inv_var_ = inv_var[i:i+1]
+        st_x_ = st_x[i:i + 1]
+        w_i_ = w_i[i:i + 1]
+        b_i_ = b_i[i:i + 1]
+        inv_var_ = inv_var[i:i + 1]
 
-        t_ = t - st_x_cum[i:i+1, -1, -1] # time since lastest event
+        t_ = t - st_x_cum[i:i + 1, -1, -1]  # time since lastest event
         t_ = (t_ - biases[-1]) / scales[-1]
 
         # Calculate temporal intensity
         t_cum = torch.cumsum(st_x_[..., -1], -1)
-        tn_ti = t_cum[..., -1:] - t_cum # t_n - t_i
+        tn_ti = t_cum[..., -1:] - t_cum  # t_n - t_i
         tn_ti = torch.cat((tn_ti, torch.zeros(1, config.num_points)), -1)
-        t_ti  = tn_ti + t_
+        t_ti = tn_ti + t_
 
         lamb_t = t_intensity(w_i_, b_i_, t_ti) / np.prod(scales)
 
         # Calculate spatial intensity
-        N = len(s_grids) # number of grid points
+        N = len(s_grids)  # number of grid points
 
         s_x_ = torch.cat((st_x_[..., :-1], background), 1).repeat(N, 1, 1)
         s_diff = s_grids.unsqueeze(1) - s_x_
-        lamb_s = s_intensity(w_i_.repeat(N, 1), b_i_.repeat(N, 1), t_ti.repeat(N, 1), 
+        lamb_s = s_intensity(w_i_.repeat(N, 1), b_i_.repeat(N, 1), t_ti.repeat(N, 1),
                              s_diff, inv_var_.repeat(N, 1, 1))
-        #print(lamb_t)
-        #print(torch.max(lamb_s))
-        #print('-----------')
 
         lamb = (lamb_s * lamb_t).view(x_nstep, y_nstep)
         lambs.append(lamb.numpy())
+    lambs = np.array(lambs)
 
     x_range = x_range.numpy() * scales[0] + biases[0]
     y_range = y_range.numpy() * scales[1] + biases[1]
