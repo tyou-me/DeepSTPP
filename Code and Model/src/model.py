@@ -469,8 +469,7 @@ def calc_lamb(model,
 The code below is added by Tian You
 =============================================================================="""
 
-def get_model_output(model, seq, device):
-    st_x, _, _, _, _ = seq
+def get_model_output(model, st_x, device):
     background = model.background.cpu().detach()
     _, w_i, b_i, inv_var = model(st_x.reshape([1,st_x.shape[0],-1]).to(device))
     w_i  = w_i.cpu().detach()
@@ -528,6 +527,7 @@ def t_integral_mesh(params, seq, time_period, scales=np.ones(1), biases=np.zeros
     tp, tq = time_period
 
     tn_ti = torch.cat((st_x_cum[-1,-1]-st_x_cum[:,2], torch.zeros(num_points)), 0)
+    print(tp)
     tp_ti_scaled = torch.sub(torch.add(tn_ti, tp), biases) /scales
     tq_ti_scaled = torch.sub(torch.add(tn_ti, tq), biases) /scales
 
@@ -549,6 +549,7 @@ def calc_expected_event_mesh(params, seq, mesh_centre, mesh_area, time_period, s
 
     s_kernel = s_kernel_mesh(params, seq, mesh_centre, scales[:2], biases[:2])
     s_integral = s_kernel * mesh_area / np.product(scales[:2])
+    print(s_kernel[0])
     t_integral = t_integral_mesh(params, seq, time_period, scales[-1], biases[-1])
     expected_event_count = torch.sum(s_integral * t_integral * w_i, -1).numpy()
     
@@ -558,60 +559,109 @@ def calc_expected_event_mesh(params, seq, mesh_centre, mesh_area, time_period, s
 
 # The following is adapted from the Jupyter notebook '2. Deep-STPP Visualization'
 
-def evaluate(model, st_scaler, test_loader, logger, device):
+# maybe the inference limit should be outside of (training) config
+
+
+def pred_next_old(seq, device, config, scales=np.ones(3), biases=np.zeros(3), params=None):
+
+    if params is None:
+        background, w_i, b_i, _ = get_model_output(model, seq, device)
+    else:
+        background, w_i, b_i, _ = params
+
+    num_points = background.shape[0]
+
+    _, _, st_x_cum, _, _ = seq
+
+    tp, tq = time_period
+
+    tn_ti = torch.cat((st_x_cum[-1,-1]-st_x_cum[:,2], torch.zeros(num_points)), 0)
+    tp_ti_scaled = torch.sub(torch.add(tn_ti, tp), biases) /scales
+    tq_ti_scaled = torch.sub(torch.add(tn_ti, tq), biases) /scales
+
+    t_integral = 1/b_i * (torch.exp(-b_i*tp_ti_scaled) - torch.exp(-b_i*tq_ti_scaled))
+    
+    t_intensity = 1
+
+
+    return 1
+
+
+def evaluate(model, scales, biases, testdata, device, config, params):
     model.eval()
     st_preds = []
     st_ys = []
     lookahead = config.lookahead
 
-    for index, data in enumerate(test_loader):
-        if len(data) == 6:
-            st_x, _, _, st_y, _, _ = data
-        else:
-            st_x, st_y = data
+    print(lookahead)
 
-        batch_size = st_x.shape[0]
-        st_pred = torch.zeros((batch_size, lookahead, 3), dtype=torch.float).to(device)
-        background = model.background.unsqueeze(0).repeat(batch_size, 1, 1).cpu().detach()
+    data = testdata
+    #for index, data in enumerate(test_loader):
+    #    if index == 0:
+            #print(index, len(data))
+    if len(data) == 5:
+        st_x, _, st_x_cum, st_y, _ = data
+    else:
+        st_x, st_y = data
+
+    batch_size = 1 #st_x.shape[0]
+    st_pred = torch.zeros((batch_size, lookahead, 3), dtype=torch.float).to(device)
+    #background = model.background.cpu().detach()
+    
+    for l in range(lookahead):
+
+        background, w_i, b_i, _ = params
+
+        #_, w_i, b_i, _ = model(st_x.reshape([1,st_x.shape[0],-1]).to(device))
+        #w_i  = w_i.cpu().detach()
+        #b_i  = b_i.cpu().detach()
         
-        for l in range(lookahead):
-            _, w_i, b_i, _ = model(st_x.to(device))
-            w_i  = w_i.cpu().detach()
-            b_i  = b_i.cpu().detach()
-            
-            st_pred_1step = np.zeros((batch_size, 1, 3))
-            
-            t_cum = torch.cumsum(st_x[..., 2], -1)
-            tn_ti = t_cum[..., -1:] - t_cum # t_n - t_i
-            tn_ti = torch.cat((tn_ti, torch.zeros(batch_size, config.num_points)), -1)
-            
-            # Time inference: integrate via linear interpolation
-            limit = config.infer_limit * st_scaler.scale_[-1]
-            ts = torch.arange(0, limit, limit * 1.0 / config.infer_nstep)
-            fts = [torch.exp(log_ft(t + tn_ti, tn_ti, w_i, b_i)) for t in ts]
-            fts = torch.stack(fts) / sum(fts, 0) # normalize probability 
-            predict_t = torch.sum(ts.unsqueeze(-1) * fts, 0) # expectation
-            st_pred_1step[:, 0, 2] = predict_t.numpy()
-            
-            # Space Inference            
-            v_i = w_i * torch.exp(-b_i * (tn_ti + predict_t.unsqueeze(-1)))
-            v_i = v_i / torch.sum(v_i, -1).unsqueeze(-1) # normalize
-            v_i = v_i.unsqueeze(-1).numpy()
-            
-            space = torch.cat((st_x[..., :2], background), 1)
-            st_pred_1step[:, 0, :2] = np.sum(v_i * space.cpu().detach().numpy(), 1)
-            
-            st_pred_1step = torch.tensor(st_pred_1step, dtype=torch.float)
-            st_pred[:, l, :] = st_pred_1step[:, 0, :]
-            st_x = torch.cat((st_x[:, 1:], st_pred_1step ), 1)
+        st_pred_1step = np.zeros((batch_size, 1, 3))
+        
+        t_cum = torch.cumsum(st_x[..., 2], -1)
+        t_last = st_x_cum[-1,-1]
+        tn_ti_2 = (t_last - st_x_cum[:,-1])/scales[-1]
+        
+
+        tn_ti = t_cum[..., -1:] - t_cum # t_n - t_i
+
+        print(tn_ti, '\n', tn_ti_2)
+
+        tn_ti = torch.cat((tn_ti, torch.zeros(config.num_points)), -1)
+        
+        # Time inference: integrate via linear interpolation
+        limit = config.infer_limit * scales[-1]
+        ts = torch.arange(0, limit, limit * 1.0 / config.infer_nstep)
+        fts = [torch.exp(log_ft(t + tn_ti, tn_ti, w_i, b_i)) for t in ts]
+        fts = torch.stack(fts) / sum(fts, 0) # normalize probability 
+        predict_t = torch.sum(ts.unsqueeze(-1) * fts, 0) # expectation
+        st_pred_1step[:, 0, 2] = predict_t.numpy()
+        
+        # Space Inference            
+        v_i = w_i * torch.exp(-b_i * (tn_ti + predict_t.unsqueeze(-1)))
+        v_i = v_i / torch.sum(v_i, -1).unsqueeze(-1) # normalize
+        v_i = v_i.unsqueeze(-1).numpy()
+        
+        space = torch.cat((st_x[..., :-1], background), 0)
+        st_pred_1step[:, 0, :2] = np.sum(v_i * space.cpu().detach().numpy(), 1)
+        
+        st_pred_1step = torch.tensor(st_pred_1step, dtype=torch.float)
+        
+        st_pred[:, l, :] = st_pred_1step[:, 0, :]
+        st_pred[:, l, -1] =  st_pred[:, l, -1]*scales + t_last
+        #print(st_x[1:, :])
+        #print(st_pred_1step[0])
+        st_x = torch.cat((st_x[1:, :], st_pred_1step[0] ), 0)
 
         st_preds.append(st_pred)
         st_ys.append(st_y)
 
+    '''
     st_preds = torch.cat(st_preds, dim=0).cpu().detach().numpy()
     st_y = torch.cat(st_ys, dim=0).cpu().detach().numpy()
     outputs = np.zeros(st_y.shape)
     targets = np.zeros(st_y.shape)
+
     
     for i in range(st_y.shape[0]):
         outputs[i] = st_scaler.inverse_transform(st_preds[i])
@@ -628,5 +678,6 @@ def evaluate(model, st_scaler, test_loader, logger, device):
     logger.info(f"The RMSE for space is {space_rmse}")
     logger.info(f"The RMSE for time is {time_rmse}")
     logger.info(f"The 3-tuple RMSE  is {total_rmse}")
+    '''
 
-    return outputs, targets, [space_rmse, time_rmse, total_rmse]
+    return st_preds, st_ys #, [space_rmse, time_rmse, total_rmse]
