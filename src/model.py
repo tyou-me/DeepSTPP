@@ -268,15 +268,15 @@ class DeepSTPP(nn.Module):
             z, _ = self.enc.encode(st_x)
         
         w_i = self.w_dec.decode(z)
-        if self.config.constrain_b is 'tanh':
+        if self.config.constrain_b == 'tanh':
             b_i = torch.tanh(self.b_dec.decode(z)) * self.config.b_max
-        elif self.config.constrain_b is 'sigmoid':
+        elif self.config.constrain_b == 'sigmoid':
             b_i = torch.sigmoid(self.b_dec.decode(z)) * self.config.b_max
-        elif self.config.constrain_b is 'neg-sigmoid':
+        elif self.config.constrain_b == 'neg-sigmoid':
             b_i = - torch.sigmoid(self.b_dec.decode(z)) * self.config.b_max
-        elif self.config.constrain_b is 'softplus':
+        elif self.config.constrain_b == 'softplus':
             b_i = torch.nn.functional.softplus(self.b_dec.decode(z))
-        elif self.config.constrain_b is 'clamp':
+        elif self.config.constrain_b == 'clamp':
             b_i = torch.clamp(self.b_dec.decode(z), -self.config.b_max, self.config.b_max)
         else:
             b_i = self.b_dec.decode(z)
